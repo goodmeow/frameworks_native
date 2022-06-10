@@ -223,17 +223,20 @@ RefreshRate RefreshRateConfigs::getBestRefreshRate(const std::vector<LayerRequir
                                                    GlobalSignals* outSignalsConsidered) const {
     std::lock_guard lock(mLock);
 
-    if (auto cached = getCachedBestRefreshRate(layers, globalSignals, outSignalsConsidered)) {
+    bool expired = false;
+
+    if (auto cached = getCachedBestRefreshRate(layers, globalSignals, outSignalsConsidered, &expired)) {
         return *cached;
     }
 
     GlobalSignals signalsConsidered;
-    RefreshRate result = getBestRefreshRateLocked(layers, globalSignals, &signalsConsidered);
+    RefreshRate result = getBestRefreshRateLocked(layers, globalSignals, &signalsConsidered, expired);
     lastBestRefreshRateInvocation.emplace(
             GetBestRefreshRateInvocation{.layerRequirements = layers,
                                          .globalSignals = globalSignals,
                                          .outSignalsConsidered = signalsConsidered,
-                                         .resultingBestRefreshRate = result});
+                                         .resultingBestRefreshRate = result,
+                                         .lastTimestamp = systemTime(SYSTEM_TIME_MONOTONIC)});
     if (outSignalsConsidered) {
         *outSignalsConsidered = signalsConsidered;
     }
@@ -242,10 +245,16 @@ RefreshRate RefreshRateConfigs::getBestRefreshRate(const std::vector<LayerRequir
 
 std::optional<RefreshRate> RefreshRateConfigs::getCachedBestRefreshRate(
         const std::vector<LayerRequirement>& layers, const GlobalSignals& globalSignals,
-        GlobalSignals* outSignalsConsidered) const {
+        GlobalSignals* outSignalsConsidered, bool *expired) const {
     const bool sameAsLastCall = lastBestRefreshRateInvocation &&
             lastBestRefreshRateInvocation->layerRequirements == layers &&
             lastBestRefreshRateInvocation->globalSignals == globalSignals;
+    const auto curTime = systemTime(SYSTEM_TIME_MONOTONIC);
+
+    if ((curTime - lastBestRefreshRateInvocation->lastTimestamp) >= EXPIRE_TIMEOUT) {
+        *expired = true;
+        return {};
+    }
 
     if (sameAsLastCall) {
         if (outSignalsConsidered) {
@@ -259,21 +268,20 @@ std::optional<RefreshRate> RefreshRateConfigs::getCachedBestRefreshRate(
 
 RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
         const std::vector<LayerRequirement>& layers, const GlobalSignals& globalSignals,
-        GlobalSignals* outSignalsConsidered) const {
+        GlobalSignals* outSignalsConsidered, const bool expired) const {
     ATRACE_CALL();
     ALOGV("getBestRefreshRate %zu layers", layers.size());
+    static bool localIsIdle;
 
     if (outSignalsConsidered) *outSignalsConsidered = {};
     const auto setTouchConsidered = [&] {
-        if (outSignalsConsidered) {
-            outSignalsConsidered->touch = true;
-        }
+        outSignalsConsidered->touch = true;
+        localIsIdle = false;
     };
 
     const auto setIdleConsidered = [&] {
-        if (outSignalsConsidered) {
-            outSignalsConsidered->idle = true;
-        }
+        outSignalsConsidered->idle = true;
+        localIsIdle = true;
     };
 
     int noVoteLayers = 0;
@@ -316,12 +324,8 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
         }
     }
 
-    const bool hasExplicitVoteLayers = explicitDefaultVoteLayers > 0 ||
-            explicitExactOrMultipleVoteLayers > 0 || explicitExact > 0;
-
-    // Consider the touch event if there are no Explicit* layers. Otherwise wait until after we've
-    // selected a refresh rate to see if we should apply touch boost.
-    if (globalSignals.touch && !hasExplicitVoteLayers) {
+    // Touch boost whenever possible as we opportunistically enter idle aggressively
+    if (globalSignals.touch) {
         ALOGV("TouchBoost - choose %s", getMaxRefreshRateByPolicyLocked().getName().c_str());
         setTouchConsidered();
         return getMaxRefreshRateByPolicyLocked();
@@ -333,6 +337,8 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
     const Policy* policy = getCurrentPolicyLocked();
     const bool primaryRangeIsSingleRate =
             policy->primaryRange.min.equalsWithMargin(policy->primaryRange.max);
+    const bool hasExplicitVoteLayers = explicitDefaultVoteLayers > 0 ||
+            explicitExactOrMultipleVoteLayers > 0 || explicitExact > 0;
 
     if (!globalSignals.touch && globalSignals.idle &&
         !(primaryRangeIsSingleRate && hasExplicitVoteLayers)) {
@@ -342,7 +348,8 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
     }
 
     if (layers.empty() || noVoteLayers == layers.size()) {
-        return getMaxRefreshRateByPolicyLocked();
+        ALOGV("No layers - choose %s", getCurrentRefreshRateByPolicyLocked().getName().c_str());
+        return getCurrentRefreshRateByPolicyLocked();
     }
 
     // Only if all layers want Min we should return Min
@@ -420,8 +427,20 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
                 continue;
             }
 
-            const auto layerScore =
+            float layerScore;
+
+            if (layer.vote == LayerVoteType::Heuristic && expired &&
+                scores[i].refreshRate->getFps().greaterThanWithMargin(Fps(60.0f))) {
+                // Time for heuristic layer to keep consuming high refresh rate has been expired
+                ALOGV("%s expired to keep using %s", formatLayerInfo(layer, weight).c_str(),
+                      scores[i].refreshRate->getName().c_str());
+                layerScore = 0;
+                localIsIdle = true;
+            } else {
+                layerScore =
                     calculateLayerScoreLocked(layer, *scores[i].refreshRate, isSeamlessSwitch);
+            }
+
             ALOGV("%s gives %s score of %.2f", formatLayerInfo(layer, weight).c_str(),
                   scores[i].refreshRate->getName().c_str(), layerScore);
             scores[i].score += weight * layerScore;
@@ -435,6 +454,20 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
             ? getBestRefreshRate(scores.rbegin(), scores.rend())
             : getBestRefreshRate(scores.begin(), scores.end());
 
+    const auto selectivelyForceIdle = [&] {
+        ALOGV("localIsIdle: %s", localIsIdle ? "true" : "false");
+        if (localIsIdle && bestRefreshRate->getFps().greaterThanWithMargin(Fps(60.0f))) {
+            /*
+             * We heavily rely on touch to boost higher than 60 fps.
+             * Fallback to 60 fps if an higher fps was calculated.
+             */
+            ALOGV("Forcing idle");
+            return *idleRefreshRate;
+        }
+
+        return *bestRefreshRate;
+    };
+
     if (primaryRangeIsSingleRate) {
         // If we never scored any layers, then choose the rate from the primary
         // range instead of picking a random score from the app range.
@@ -444,7 +477,7 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
                   getMaxRefreshRateByPolicyLocked().getName().c_str());
             return getMaxRefreshRateByPolicyLocked();
         } else {
-            return *bestRefreshRate;
+            return selectivelyForceIdle();
         }
     }
 
@@ -470,7 +503,7 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
         return touchRefreshRate;
     }
 
-    return *bestRefreshRate;
+    return selectivelyForceIdle();
 }
 
 std::unordered_map<uid_t, std::vector<const RefreshRateConfigs::LayerRequirement*>>
@@ -832,6 +865,11 @@ void RefreshRateConfigs::getSortedRefreshRateListLocked(
     outRefreshRates->reserve(mRefreshRates.size());
     for (const auto& [type, refreshRate] : mRefreshRates) {
         if (shouldAddRefreshRate(*refreshRate)) {
+            if (refreshRate->getFps().equalsWithMargin(Fps(60.0f))) {
+                idleRefreshRate = std::make_unique<RefreshRateConfigs::RefreshRate>(*refreshRate);
+                ALOGV("idleRefreshRate set!");
+            }
+
             ALOGV("getSortedRefreshRateListLocked: mode %d added to list policy",
                   refreshRate->getModeId().value());
             outRefreshRates->push_back(refreshRate.get());
